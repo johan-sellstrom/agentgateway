@@ -7822,6 +7822,192 @@ async fn mcp_guardrails_url_elicitation_required_reaches_the_client() {
 	assert_eq!(mcp_error.data.as_ref(), Some(&elicitation));
 }
 
+/// The real HAPS guard, driven through a real gateway by a real MCP client. The haps-guard
+/// unit tests prove each check in isolation; this proves they hold once wired in. In order:
+/// a call with no approval sends the host to the Presence Provider; an approved call reaches
+/// the tool with exactly the approved arguments; a tampered call and a replay do not; and the
+/// credential never reaches the tool, while the rest of `_meta` does.
+#[tokio::test]
+async fn haps_guard_binds_an_approval_to_the_exact_call() {
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	use aws_lc_rs::rand::SystemRandom;
+	use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+	use haps_guard::server::HapsGuardService;
+	use haps_guard::{Guard, GuardConfig, PohpLevel, ToolPolicy, haps_canon, haps_hash};
+	use jsonwebtoken::{Algorithm, EncodingKey, Header};
+	use protos::ext_mcp::ext_mcp_server::ExtMcpServer;
+	use rmcp::model::{MetaObject, RequestMetaObject};
+	use serde_json::{Value, json};
+
+	// A Presence Provider signing key, published to the guard as a JWKS.
+	let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+	let public = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+	let x = haps_hash::base64url_unpadded(public.public_key().as_ref());
+	let signing_key = EncodingKey::from_ed_der(pkcs8.as_ref());
+
+	let policy = |action_type: &str| ToolPolicy {
+		action_type: action_type.into(),
+		min_level: PohpLevel::parse("HAPS-PoHP-2").unwrap(),
+	};
+	let guard = Guard::new(GuardConfig {
+		tools: HashMap::from([
+			("echo".to_owned(), policy("demo.echo")),
+			("inspect_meta".to_owned(), policy("demo.inspect_meta")),
+		]),
+		keys: serde_json::from_value(json!({"keys": [
+			{"kty": "OKP", "crv": "Ed25519", "kid": "pp-1", "alg": "EdDSA", "use": "sig", "x": x}
+		]}))
+		.unwrap(),
+		issuers: vec!["did:web:pp.example".into()],
+		audience: "did:web:gateway.example".into(),
+		elicitation_url: "https://pp.example/approve".into(),
+		clock_skew_secs: 60,
+	});
+	let guard_srv =
+		crate::test_helpers::spawn_service(ExtMcpServer::new(HapsGuardService::new(guard))).await;
+
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy(guard_srv.address)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+
+	let hash = |v: &Value| haps_hash::hash_value(&haps_canon::parse(&v.to_string()).unwrap());
+	let now = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+	// What the human is shown and approves, for one action.
+	let approval = |action_type: &str, arguments: &Value| {
+		let intent = json!({
+			"version": "0.4",
+			"profile": "haps.profile.demo/v0.1",
+			"intentId": "intent-1",
+			"action": {"type": action_type, "parameters": arguments},
+		});
+		let view = json!({"title": "Approve", "action": action_type, "detail": arguments});
+		(intent, view)
+	};
+	// The `_meta` carrying a signed approval of `intent`.
+	let approved_meta = |jti: &str, intent: &Value, view: &Value| {
+		let claims = json!({
+			"issuer": "did:web:pp.example",
+			"intent_hash": hash(intent),
+			"presentation_hash": hash(view),
+			"aud": "did:web:gateway.example",
+			"jti": jti,
+			"iat": now,
+			"exp": now + 120,
+			"assurance": {"level": "HAPS-PoHP-2", "verifiedAt": "2026-09-24T00:00:00Z", "method": "webauthn.uv"},
+			"providerCertification": {"certifier": "did:web:certs.example", "id": "cert-1"},
+		});
+		let mut header = Header::new(Algorithm::EdDSA);
+		header.kid = Some("pp-1".into());
+		let credential = jsonwebtoken::encode(&header, &claims, &signing_key).unwrap();
+		json!({"haps/credential": credential, "haps/actionIntent": intent, "haps/signingView": view})
+	};
+	let call = |tool: &'static str, arguments: &Value, meta: Option<&Value>| {
+		let mut params = rmcp::model::CallToolRequestParams::new(tool)
+			.with_arguments(arguments.as_object().cloned().unwrap());
+		if let Some(m) = meta {
+			params.meta = Some(RequestMetaObject(MetaObject(
+				m.as_object().cloned().unwrap(),
+			)));
+		}
+		params
+	};
+	let text = |r: &rmcp::model::CallToolResult| r.content[0].as_text().expect("text").text.clone();
+	let denial_text = |r: &rmcp::model::CallToolResult| {
+		assert_eq!(r.is_error, Some(true), "expected a denial, got {r:?}");
+		text(r)
+	};
+
+	// Monetary amounts are strings: HAPS admits no fractional numbers.
+	let args = json!({"msg": "pay 250.00 GBP to Example Supplier Ltd"});
+	let (intent, view) = approval("demo.echo", &args);
+
+	// 1. No approval yet: the host is told to send the human to the Presence Provider.
+	let err = client
+		.call_tool(call("echo", &args, None))
+		.await
+		.expect_err("no approval must elicit, not reach the tool");
+	let rmcp::ServiceError::McpError(e) = &err else {
+		panic!("expected ServiceError::McpError, got: {err:?}");
+	};
+	assert_eq!(e.code.0, -32042, "got {}", e.code.0);
+	let elicitation = &e.data.as_ref().expect("elicitation data")["elicitations"][0];
+	assert_eq!(elicitation["mode"], "url");
+	assert!(
+		elicitation["url"]
+			.as_str()
+			.unwrap()
+			.starts_with("https://pp.example/approve?elicitationId=sha256:"),
+		"{elicitation}"
+	);
+
+	// 2. Approved: the tool runs, and what it received is exactly what was approved.
+	let approved = approved_meta("jti-1", &intent, &view);
+	let result = client
+		.call_tool(call("echo", &args, Some(&approved)))
+		.await
+		.expect("an approved call reaches the tool");
+	assert_ne!(result.is_error, Some(true), "{result:?}");
+	let echoed: Value = serde_json::from_str(&text(&result)).unwrap();
+	assert_eq!(echoed, args, "the tool must receive the approved arguments");
+
+	// 3. Tampered: a valid approval, but not for these arguments.
+	let tampered = json!({"msg": "pay 2500.00 GBP to Example Supplier Ltd"});
+	let result = client
+		.call_tool(call(
+			"echo",
+			&tampered,
+			Some(&approved_meta("jti-2", &intent, &view)),
+		))
+		.await
+		.expect("a denial is a tool result the model can read");
+	assert!(
+		denial_text(&result).contains("differ from the approved action"),
+		"{result:?}"
+	);
+
+	// 4. Replayed: the approval from step 2 cannot be spent twice.
+	let result = client
+		.call_tool(call("echo", &args, Some(&approved)))
+		.await
+		.expect("a denial is a tool result the model can read");
+	assert!(
+		denial_text(&result).contains("already been used"),
+		"{result:?}"
+	);
+
+	// 5. The credential stops at the gateway; the rest of `_meta` goes through.
+	let none = json!({});
+	let (intent, view) = approval("demo.inspect_meta", &none);
+	let mut meta = approved_meta("jti-3", &intent, &view);
+	meta["demo.example/trace"] = json!("trace-1");
+	let result = client
+		.call_tool(call("inspect_meta", &none, Some(&meta)))
+		.await
+		.expect("an approved call reaches the tool");
+	assert_ne!(result.is_error, Some(true), "{result:?}");
+	let received: Value = serde_json::from_str(&text(&result)).unwrap();
+	for key in ["haps/credential", "haps/actionIntent", "haps/signingView"] {
+		assert!(
+			received.get(key).is_none(),
+			"{key} reached the upstream: {received}"
+		);
+	}
+	assert_eq!(
+		received["demo.example/trace"], "trace-1",
+		"other _meta must still reach the upstream: {received}"
+	);
+}
+
 /// A processor that returns an empty `_meta` has cleared it, and nothing of the original may
 /// reach the upstream. The haps-guard relies on this when an approval was all `_meta` held.
 /// It needs a mock processor: through the rmcp client `_meta` always carries a progress token,

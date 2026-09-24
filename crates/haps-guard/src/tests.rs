@@ -164,7 +164,8 @@ fn a_credential_carrying_the_published_hashes_is_accepted() {
 	);
 	// The upstream receives exactly the approved arguments, and never the credential.
 	let forwarded: Value = serde_json::from_slice(&params).unwrap();
-	assert!(forwarded.get("_meta").is_none(), "{forwarded}");
+	// Emptied but present: an absent `_meta` would tell the gateway to keep the original.
+	assert_eq!(forwarded["_meta"], json!({}), "{forwarded}");
 	let fwd_args = serde_json::to_string(&forwarded["arguments"]).unwrap();
 	let appr_args = serde_json::to_string(&approved_arguments()).unwrap();
 	assert_eq!(

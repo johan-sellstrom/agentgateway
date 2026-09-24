@@ -30,6 +30,10 @@
 
 pub mod server;
 
+/// Re-exported so a caller computing `intent_hash` or `presentation_hash` uses the same
+/// verified crates the guard checks against, rather than a second implementation.
+pub use {haps_canon, haps_hash};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -413,9 +417,17 @@ fn member<'a>(v: &'a Canon, key: &str) -> Option<&'a Canon> {
 	}
 }
 
-/// Remove the HAPS keys from `_meta`, dropping `_meta` if nothing else is left, so the
-/// upstream never receives the credential. Arguments were already verified to contain only
-/// integers and strings, which `serde_json` round-trips exactly.
+/// Remove the HAPS keys from `_meta` so the upstream never receives the credential. Other keys
+/// -- progress tokens, trace context, a modern client's protocol envelope -- are kept.
+///
+/// This holds only on a gateway that honours a processor's `_meta` edits. Upstream
+/// agentgateway, without the change in this fork, discards them and forwards the original
+/// `_meta`, credential included -- and never shows it to the guard in the first place.
+///
+/// `_meta` is left present even when nothing remains. To the gateway an absent `_meta` in a
+/// mutation means "not edited", which keeps the original -- credential included -- while an
+/// empty one means "cleared". Arguments were already verified to contain only integers and
+/// strings, which `serde_json` round-trips exactly.
 fn strip_haps_meta(raw: &[u8]) -> Result<Vec<u8>, String> {
 	let mut params: serde_json::Value = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
 	if let Some(obj) = params.as_object_mut()
@@ -423,9 +435,6 @@ fn strip_haps_meta(raw: &[u8]) -> Result<Vec<u8>, String> {
 	{
 		for k in HAPS_META_KEYS {
 			meta.remove(k);
-		}
-		if meta.is_empty() {
-			obj.remove("_meta");
 		}
 	}
 	serde_json::to_vec(&params).map_err(|e| e.to_string())

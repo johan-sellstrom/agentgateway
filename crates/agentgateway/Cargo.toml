@@ -205,6 +205,8 @@ pprof-alloc.workspace = true
 tokio = { workspace = true }
 
 [dev-dependencies]
+# The HAPS guard, driven end-to-end through a real gateway in mcp_tests. Private fork only.
+haps-guard = { path = "../haps-guard" }
 # Enable the SPIFFE Workload API bindings for tests only (fake agent for SPIFFE dataplane tests).
 protos = { workspace = true, features = ["spiffe-test-server"] }
 assert_matches.workspace = true
