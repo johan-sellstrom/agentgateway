@@ -7743,6 +7743,78 @@ async fn mcp_guardrails_tool_call_reject_is_error() {
 	assert_eq!(text, "denied by mock mcpGuardrails");
 }
 
+/// A processor that needs the user to act returns `-32042` through `mcp_error`. It must reach
+/// the client as a JSON-RPC error -- not a tool result -- or the host never opens the URL.
+/// The test client negotiates with `initialize`, so this also covers the pre-modern clients
+/// that the 2025-11-25 revision defining `-32042` belongs to.
+#[tokio::test]
+async fn mcp_guardrails_url_elicitation_required_reaches_the_client() {
+	use protos::ext_mcp::authorization_error::Code;
+	use protos::ext_mcp::{AuthorizationError, McpRequestResult, mcp_request_result};
+
+	use crate::test_helpers::extmcpmock::{closure_mock, pass_response};
+
+	let elicitation = serde_json::json!({
+		"elicitations": [{
+			"mode": "url",
+			"elicitationId": "haps-e-1",
+			"url": "https://pp.example/approve/haps-e-1",
+			"message": "Approve this payment",
+		}]
+	});
+	let payload = serde_json::json!({
+		"code": -32042,
+		"message": "URL elicitation required",
+		"data": elicitation,
+	});
+	let extmcp_mock = closure_mock(
+		move |_| {
+			Ok(McpRequestResult {
+				result: Some(mcp_request_result::Result::Error(AuthorizationError {
+					// Deliberately not the code the client should see: `mcp_error` must win.
+					code: Code::PermissionDenied as i32,
+					reason: "approval required".into(),
+					mcp_error: Some(serde_json::to_vec(&payload).unwrap().into()),
+				})),
+				header_mutation: None,
+				metadata: None,
+			})
+		},
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy(extmcp_mock.address)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+	let err = client
+		.call_tool(
+			rmcp::model::CallToolRequestParams::new("echo").with_arguments(
+				serde_json::json!({"hi": "world"})
+					.as_object()
+					.cloned()
+					.unwrap(),
+			),
+		)
+		.await
+		.expect_err("URL elicitation required must be a protocol error, not a tool result");
+
+	let mcp_error = match &err {
+		rmcp::ServiceError::McpError(e) => e,
+		other => panic!("expected ServiceError::McpError, got: {other:?}"),
+	};
+	assert_eq!(mcp_error.code.0, -32042, "got {}", mcp_error.code.0);
+	assert_eq!(mcp_error.message.as_ref(), "URL elicitation required");
+	assert_eq!(mcp_error.data.as_ref(), Some(&elicitation));
+}
+
 #[tokio::test]
 async fn mcp_guardrails_denies_tool_by_name() {
 	use protos::ext_mcp::authorization_error::Code;

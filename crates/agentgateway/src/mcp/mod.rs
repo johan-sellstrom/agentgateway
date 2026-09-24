@@ -61,6 +61,10 @@ impl agent_http::BodyExtension for CachedRequest {}
 /// Application-defined "over quota" code (MCP defines none); shared with the guardrail mapping.
 pub(crate) const RESOURCE_EXHAUSTED: ErrorCode = ErrorCode(-32003);
 
+/// MCP 2025-11-25 "URL elicitation required": the server needs the user to complete an
+/// interaction at a URL before the request can succeed. rmcp defines no constant for it.
+pub(crate) const URL_ELICITATION_REQUIRED: ErrorCode = ErrorCode(-32042);
+
 /// Method names of rmcp's typed `ClientRequest` variants. Keep this list in sync with rmcp rev
 /// bumps; only `CustomRequest` and failed typed parses consult it, so drift cannot 404 typed
 /// requests.
@@ -198,6 +202,22 @@ pub enum Error {
 	NoBackends,
 }
 
+/// Whether a `tools/call` guardrail rejection stays a JSON-RPC error instead of becoming a tool
+/// result with `isError`. A tool result is addressed to the model, which suits a denial it can
+/// explain. These two are addressed to the host instead:
+///
+/// - an internal error looks like a protocol failure, so it bubbles back up;
+/// - URL elicitation required tells the client to open a URL, which a tool result can never do.
+///
+/// This holds for legacy clients too, and deliberately so. The 2025-11-25 revision that defines
+/// `-32042` predates the gateway's modern era, so those clients count as legacy here. What
+/// `strip_unsupported_client_capabilities` removes for them is server-*initiated* elicitation,
+/// which needs reverse routing; `-32042` is an error *response* to the client's own request and
+/// needs none.
+fn guardrail_rejection_is_protocol_error(code: ErrorCode) -> bool {
+	code == ErrorCode::INTERNAL_ERROR || code == URL_ELICITATION_REQUIRED
+}
+
 fn tool_error_body(
 	request_id: &RequestId,
 	text: String,
@@ -235,13 +255,12 @@ impl Error {
 				}
 				return tool_error_body(request_id, text, *downstream_modern);
 			},
-			// internal error sure looks like a protocol error so making the decision to bubble it back up
 			Error::McpGuardrails {
 				request_id,
 				rej,
 				was_tool_call: true,
 				downstream_modern,
-			} if rej.code != ErrorCode::INTERNAL_ERROR => {
+			} if !guardrail_rejection_is_protocol_error(rej.code) => {
 				return tool_error_body(request_id, rej.message.to_string(), *downstream_modern);
 			},
 			_ => {},
