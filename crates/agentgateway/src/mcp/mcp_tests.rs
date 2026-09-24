@@ -5306,6 +5306,13 @@ mod mockserver {
 			)]))
 		}
 
+		#[tool(description = "Echo the request _meta this server received")]
+		fn inspect_meta(&self, rq: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+			Ok(CallToolResult::success(vec![ContentBlock::text(
+				serde_json::Value::Object(rq.meta.0.0.clone()).to_string(),
+			)]))
+		}
+
 		#[tool(description = "Get initialize call count")]
 		async fn get_init_count(&self) -> Result<CallToolResult, McpError> {
 			let init_counter = self.init_counter.lock().await;
@@ -7813,6 +7820,96 @@ async fn mcp_guardrails_url_elicitation_required_reaches_the_client() {
 	assert_eq!(mcp_error.code.0, -32042, "got {}", mcp_error.code.0);
 	assert_eq!(mcp_error.message.as_ref(), "URL elicitation required");
 	assert_eq!(mcp_error.data.as_ref(), Some(&elicitation));
+}
+
+/// A processor that returns an empty `_meta` has cleared it, and nothing of the original may
+/// reach the upstream. The haps-guard relies on this when an approval was all `_meta` held.
+/// It needs a mock processor: through the rmcp client `_meta` always carries a progress token,
+/// so a real client never produces the emptied case.
+#[tokio::test]
+async fn mcp_guardrails_mutation_with_empty_meta_clears_it() {
+	use rmcp::model::{MetaObject, RequestMetaObject};
+
+	use crate::test_helpers::extmcpmock::{closure_mock, mutated_request_json, pass_response};
+
+	let extmcp_mock = closure_mock(
+		|_| {
+			mutated_request_json(
+				serde_json::json!({"name": "inspect_meta", "arguments": {}, "_meta": {}}),
+			)
+		},
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy(extmcp_mock.address)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+
+	let mut params =
+		rmcp::model::CallToolRequestParams::new("inspect_meta").with_arguments(serde_json::Map::new());
+	params.meta = Some(RequestMetaObject(MetaObject(
+		serde_json::json!({"haps/credential": "secret-token", "demo.example/trace": "trace-1"})
+			.as_object()
+			.cloned()
+			.unwrap(),
+	)));
+	let result = client
+		.call_tool(params)
+		.await
+		.expect("mutated call succeeds");
+	let received: serde_json::Value =
+		serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+	assert!(received.get("haps/credential").is_none(), "{received}");
+	assert!(received.get("demo.example/trace").is_none(), "{received}");
+}
+
+/// A processor that rewrites params without mentioning `_meta` must not strip it. Processors
+/// written before `_meta` reached them return params without it, and the gateway kept the
+/// original then; an absent `_meta` in a mutation still means "not edited".
+#[tokio::test]
+async fn mcp_guardrails_mutation_without_meta_keeps_the_request_meta() {
+	use rmcp::model::{MetaObject, RequestMetaObject};
+
+	use crate::test_helpers::extmcpmock::{closure_mock, mutated_request_json, pass_response};
+
+	let extmcp_mock = closure_mock(
+		|_| mutated_request_json(serde_json::json!({"name": "inspect_meta", "arguments": {}})),
+		|_| pass_response(),
+	)
+	.spawn()
+	.await;
+	let mock = mock_streamable_http_server(true).await;
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy(extmcp_mock.address)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+
+	let mut params =
+		rmcp::model::CallToolRequestParams::new("inspect_meta").with_arguments(serde_json::Map::new());
+	params.meta = Some(RequestMetaObject(MetaObject(
+		serde_json::json!({"demo.example/trace": "trace-1"})
+			.as_object()
+			.cloned()
+			.unwrap(),
+	)));
+	let result = client
+		.call_tool(params)
+		.await
+		.expect("mutated call succeeds");
+	let received: serde_json::Value =
+		serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+	assert_eq!(received["demo.example/trace"], "trace-1", "{received}");
 }
 
 #[tokio::test]

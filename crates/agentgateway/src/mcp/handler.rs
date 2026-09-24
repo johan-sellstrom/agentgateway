@@ -737,10 +737,11 @@ impl Relay {
 		backend: &str,
 		method: &str,
 		params: &mut P,
+		extensions: &mut rmcp::model::Extensions,
 		ctx: &mut IncomingRequestContext,
 	) -> Result<(), UpstreamError>
 	where
-		P: serde::Serialize + serde::de::DeserializeOwned,
+		P: serde::Serialize + serde::de::DeserializeOwned + rmcp::model::RequestParamsMeta,
 	{
 		let Some(ext) = self.mcp_guardrails.as_ref() else {
 			return Ok(());
@@ -750,10 +751,10 @@ impl Relay {
 		if !ext.runs_request(method) {
 			return Ok(());
 		}
-		let params_b = serde_json::to_vec(&*params)
+		let params_b = serialize_with_request_meta(params, extensions)
 			.map_err(|e| UpstreamError::InvalidRequest(format!("serialize {method} params: {e}")))?;
 		let backends = [backend.to_string()];
-		if let Some(p) = self
+		if let Some(mut p) = self
 			.run_guardrails_call_request::<P>(
 				&mut crate::mcp::guardrails::CallRequestCtx {
 					backends: &backends,
@@ -764,6 +765,7 @@ impl Relay {
 			)
 			.await?
 		{
+			apply_mutated_meta(&mut p, extensions);
 			*params = p;
 		}
 		Ok(())
@@ -1833,6 +1835,64 @@ fn respond_with_guardrails(
 			keep_alive,
 		),
 		None => messages_to_response(id, stream, mcp_log, ctx_downstream_modern(ctx), keep_alive),
+	}
+}
+
+/// The request's `_meta` as it will be forwarded: rmcp merges the typed params field with the
+/// request extensions, and the extensions win on a key conflict.
+fn effective_request_meta<P: rmcp::model::RequestParamsMeta>(
+	params: &P,
+	extensions: &rmcp::model::Extensions,
+) -> Option<RequestMetaObject> {
+	let mut merged = params.meta().cloned().unwrap_or_default();
+	if let Some(ext) = extensions.get::<RequestMetaObject>() {
+		for (k, v) in ext.0.0.iter() {
+			merged.0.0.insert(k.clone(), v.clone());
+		}
+	}
+	(!merged.0.0.is_empty()).then_some(merged)
+}
+
+/// Serialize `params` for a guardrail processor with `_meta` included.
+///
+/// rmcp moves the wire `params._meta` into the request extensions when it deserializes a
+/// request, leaving the typed field empty. Serializing `params` alone would therefore hand
+/// processors params without `_meta`, although ext_mcp documents `mcp_request` as the JSON-RPC
+/// params. The typed field is restored afterwards, so forwarding is unaffected.
+fn serialize_with_request_meta<P>(
+	params: &mut P,
+	extensions: &rmcp::model::Extensions,
+) -> serde_json::Result<Vec<u8>>
+where
+	P: serde::Serialize + rmcp::model::RequestParamsMeta,
+{
+	let effective = effective_request_meta(params, extensions);
+	let typed = std::mem::replace(params.meta_mut(), effective);
+	let out = serde_json::to_vec(&*params);
+	*params.meta_mut() = typed;
+	out
+}
+
+/// Make a processor's edit to `_meta` reach the upstream. Left in the typed field it would be
+/// overridden, since rmcp gives the extensions precedence when serializing, so it is moved into
+/// the extensions:
+///
+/// - absent from the mutation: the request's `_meta` is left as it was. Processors written
+///   before `_meta` was visible to them return params without it and must not strip it;
+/// - present and empty: the processor cleared it, so it is removed;
+/// - present with keys: it replaces the request's `_meta`.
+fn apply_mutated_meta<P: rmcp::model::RequestParamsMeta>(
+	mutated: &mut P,
+	extensions: &mut rmcp::model::Extensions,
+) {
+	match mutated.meta_mut().take() {
+		None => {},
+		Some(m) if m.0.0.is_empty() => {
+			extensions.remove::<RequestMetaObject>();
+		},
+		Some(m) => {
+			extensions.insert(m);
+		},
 	}
 }
 
