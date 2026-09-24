@@ -21,6 +21,7 @@ members = [
     "crates/protos",
     "crates/xds",
     "crates/xtask",
+    "crates/haps-guard",
 ]
 default-members = [
     "crates/agentgateway",

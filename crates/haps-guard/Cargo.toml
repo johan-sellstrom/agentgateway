@@ -1,0 +1,35 @@
+[package]
+name = "haps-guard"
+description = "Experimental mcpGuardrails processor requiring a HAPS Consent Credential bound to the exact MCP tool call; not production-ready"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+publish = { workspace = true }
+
+[[bin]]
+name = "haps-guard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
+prost-wkt-types.workspace = true
+protos.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# The HAPS canonicalizer and hash, used by path rather than vendored: the Lean and
+# Kani results in HAPP-reference apply to that crate, and a copy would silently
+# stop being the checked artifact. Switch to a git dependency once HAPP-reference
+# is published.
+haps-canon = { path = "../../../HAPP-reference/crates/haps-canon" }
+haps-hash = { path = "../../../HAPP-reference/crates/haps-hash" }
+
+[dev-dependencies]
+aws-lc-rs.workspace = true
