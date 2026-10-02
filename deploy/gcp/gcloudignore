@@ -1,0 +1,22 @@
+# Upload filter for `gcloud builds submit` (passed with --ignore-file). Only what the
+# three Dockerfiles COPY is needed; everything else stays local.
+/.git
+/.github
+/.claude
+/target/
+**/target/
+**/node_modules/
+/ui/dist/
+/controller/
+/manifests/
+/examples/
+/architecture/
+/design/
+/fuzz/
+/img/
+/api/
+/common/
+/deploy/gcp/.secrets/
+/deploy/gcp/.out/
+*.local
+.DS_Store
