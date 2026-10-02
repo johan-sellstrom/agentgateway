@@ -12,7 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 prost-wkt-types.workspace = true
 protos.workspace = true
@@ -23,13 +25,16 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
+# The shared replay and challenge store. Optional at runtime: the in-memory store needs none.
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 
-# The HAPS canonicalizer and hash, used by path rather than vendored: the Lean and
-# Kani results in HAPP-reference apply to that crate, and a copy would silently
-# stop being the checked artifact. Switch to a git dependency once HAPP-reference
-# is published.
-haps-canon = { path = "../../../HAPP-reference/crates/haps-canon" }
-haps-hash = { path = "../../../HAPP-reference/crates/haps-hash" }
+# The HAPS canonicalizer and hash, from the public HAPS reference repository at a pinned
+# commit, rather than vendored: the Lean and Kani results apply to these crates, and a copy
+# would silently stop being the checked artifact. At this commit their trees are identical
+# (same git tree hashes) to the HAPP-reference copy the guard was first built against.
+haps-canon = { git = "https://github.com/iProov/HAPS-reference", rev = "fb15eac5773ae113bd62fdf1ac798217415a3f8f" }
+haps-hash = { git = "https://github.com/iProov/HAPS-reference", rev = "fb15eac5773ae113bd62fdf1ac798217415a3f8f" }
 
 [dev-dependencies]
 aws-lc-rs.workspace = true

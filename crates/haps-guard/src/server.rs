@@ -30,11 +30,12 @@ impl HapsGuardService {
 	}
 
 	/// Decide one request against an explicit clock; the RPC handler passes the real one.
-	pub fn decide(&self, req: &McpRequest, now: u64) -> McpRequestResult {
+	pub async fn decide(&self, req: &McpRequest, now: u64) -> McpRequestResult {
 		let tool = tool_name(req);
 		match self
 			.guard
 			.check(&req.method, req.mcp_request.as_deref(), now)
+			.await
 		{
 			Decision::NotGated => pass(),
 			Decision::Approved { params, audit } => {
@@ -43,6 +44,9 @@ impl HapsGuardService {
 					jti = %audit.jti,
 					issuer = %audit.issuer,
 					level = %audit.level,
+					method = %audit.method,
+					certifier = %audit.certifier,
+					challenge = audit.challenge_id.as_deref().unwrap_or("-"),
 					"haps-guard: approved"
 				);
 				McpRequestResult {
@@ -81,7 +85,9 @@ impl ExtMcp for HapsGuardService {
 		&self,
 		request: Request<McpRequest>,
 	) -> Result<Response<McpRequestResult>, Status> {
-		Ok(Response::new(self.decide(request.get_ref(), unix_now())))
+		Ok(Response::new(
+			self.decide(request.get_ref(), unix_now()).await,
+		))
 	}
 
 	async fn check_response(
@@ -114,14 +120,21 @@ fn reject(reason: String, mcp_error: Option<serde_json::Value>) -> McpRequestRes
 	}
 }
 
-/// Exposed to gateway CEL as `extMcp.haps.*`, for audit and downstream policy.
+/// Exposed to gateway CEL as `extMcp.haps.*`, for audit and downstream policy. The factor sits
+/// beside the level (FACTOR-RP-05), so a later review can tell what kind of proof was accepted.
 fn audit_metadata(audit: &crate::Audit) -> Option<prost_wkt_types::Struct> {
 	serde_json::from_value(serde_json::json!({
 		"haps": {
 			"jti": audit.jti,
 			"issuer": audit.issuer,
 			"level": audit.level,
+			"method": audit.method,
 			"actionType": audit.action_type,
+			"certifier": audit.certifier,
+			"providerId": audit.provider_id,
+			"evaluation": audit.evaluation,
+			"challengeId": audit.challenge_id,
+			"variedWithinEnvelope": audit.varied_within_envelope,
 		}
 	}))
 	.ok()
