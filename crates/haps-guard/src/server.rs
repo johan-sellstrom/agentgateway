@@ -17,6 +17,12 @@ use crate::{Decision, Guard};
 /// MCP 2025-11-25 "URL elicitation required".
 pub const URL_ELICITATION_REQUIRED: i64 = -32042;
 
+/// The response-metadata key under which the gateway must send a reserved use back, for tools
+/// that spend on success: configure the guardrail with
+/// `metadata: { hapsReservation: "mcpGuardrails.haps.reservation" }`. The same expression is
+/// evaluated for the request, where it finds nothing; that is expected.
+pub const RESERVATION_METADATA_KEY: &str = "hapsReservation";
+
 #[derive(Clone)]
 pub struct HapsGuardService {
 	guard: Arc<Guard>,
@@ -79,6 +85,41 @@ impl HapsGuardService {
 	}
 }
 
+impl HapsGuardService {
+	/// Settle a use reserved for this response, if there is one. The response always passes
+	/// unchanged: settling is bookkeeping, and the tool has already run.
+	pub async fn settle(&self, resp: &McpResponse, now: u64) -> McpResponseResult {
+		let reservation = resp
+			.metadata_context
+			.as_ref()
+			.and_then(|m| serde_json::to_value(m).ok())
+			.and_then(|m| {
+				m.get(RESERVATION_METADATA_KEY)
+					.and_then(|v| v.as_str())
+					.map(str::to_owned)
+			});
+		if resp.method == "tools/call"
+			&& let Some(id) = reservation
+		{
+			match self.guard.settle(&id, &resp.mcp_response, now).await {
+				crate::Settlement::Spent => info!(reservation = %id, "haps-guard: use spent"),
+				crate::Settlement::Released => {
+					info!(reservation = %id, "haps-guard: tool failed, use given back")
+				},
+				crate::Settlement::Unknown => {
+					warn!(reservation = %id, "haps-guard: no such reservation; it lapsed or was settled")
+				},
+				crate::Settlement::Failed(e) => {
+					warn!(reservation = %id, error = %e, "haps-guard: could not settle; the reservation will lapse")
+				},
+			}
+		}
+		McpResponseResult {
+			result: Some(mcp_response_result::Result::Pass(Pass {})),
+		}
+	}
+}
+
 #[tonic::async_trait]
 impl ExtMcp for HapsGuardService {
 	async fn check_request(
@@ -92,11 +133,11 @@ impl ExtMcp for HapsGuardService {
 
 	async fn check_response(
 		&self,
-		_request: Request<McpResponse>,
+		request: Request<McpResponse>,
 	) -> Result<Response<McpResponseResult>, Status> {
-		Ok(Response::new(McpResponseResult {
-			result: Some(mcp_response_result::Result::Pass(Pass {})),
-		}))
+		Ok(Response::new(
+			self.settle(request.get_ref(), unix_now()).await,
+		))
 	}
 }
 
@@ -120,7 +161,7 @@ fn reject(reason: String, mcp_error: Option<serde_json::Value>) -> McpRequestRes
 	}
 }
 
-/// Exposed to gateway CEL as `extMcp.haps.*`, for audit and downstream policy. The factor sits
+/// Exposed to gateway CEL as `mcpGuardrails.haps.*`, for audit and downstream policy. The factor sits
 /// beside the level (FACTOR-RP-05), so a later review can tell what kind of proof was accepted.
 fn audit_metadata(audit: &crate::Audit) -> Option<prost_wkt_types::Struct> {
 	serde_json::from_value(serde_json::json!({
@@ -135,6 +176,7 @@ fn audit_metadata(audit: &crate::Audit) -> Option<prost_wkt_types::Struct> {
 			"evaluation": audit.evaluation,
 			"challengeId": audit.challenge_id,
 			"variedWithinEnvelope": audit.varied_within_envelope,
+			"reservation": audit.reservation_id,
 		}
 	}))
 	.ok()

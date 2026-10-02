@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::envelope::{Pointer, RuleKind};
-use crate::store::MemoryStore;
+use crate::store::{MemoryStore, RedisOptions, RedisTopology, SettleOutcome};
 
 // The published HAPS v0.4 payment vector. Accepting a credential that carries the
 // *published* hashes ties the guard to the specification rather than to its own hash code.
@@ -303,6 +303,7 @@ async fn a_credential_carrying_the_published_hashes_is_accepted() {
 			evaluation: "Example Evaluation Lab EEL-2026-0042".into(),
 			challenge_id: None,
 			varied_within_envelope: vec![],
+			reservation_id: None,
 		}
 	);
 	// The upstream receives exactly the approved arguments, and never the credential.
@@ -1492,6 +1493,7 @@ fn a_jti_and_a_challenge_are_spent_together_or_not_at_all() {
 			max_uses: Some(1),
 			retain_until: NOW + 100,
 			challenge_id: Some("never-issued".into()),
+			reservation: None,
 		};
 		assert_eq!(
 			s.consume(&gone, NOW).await.unwrap(),
@@ -1540,6 +1542,245 @@ fn outstanding_challenges_are_capped() {
 		// Expired challenges make room.
 		s.put_challenge("later", &record, NOW + 301).await.unwrap();
 	});
+}
+
+/// What every store backend must do with reservations. Run against memory here, and against
+/// each Redis topology in `redis_store`. `now` must be the wall clock: Redis expires keys by it.
+pub(crate) async fn reservation_contract(s: &StateStore, now: u64) {
+	let reserve = |jti: &str, challenge: Option<&str>, id: &str, ttl: u64| Consume {
+		jti: jti.into(),
+		max_uses: Some(1),
+		retain_until: now + 600,
+		challenge_id: challenge.map(Into::into),
+		reservation: Some(crate::store::Reservation {
+			id: id.into(),
+			expires_at: now + ttl,
+		}),
+	};
+	let spend_now = |jti: &str| Consume {
+		reservation: None,
+		..reserve(jti, None, "", 0)
+	};
+	use ConsumeOutcome::*;
+
+	// A reservation counts as the use while it lives.
+	assert_eq!(
+		s.consume(&reserve("a", None, "r1", 60), now).await.unwrap(),
+		Consumed
+	);
+	assert_eq!(
+		s.consume(&reserve("a", None, "r2", 60), now).await.unwrap(),
+		Replayed
+	);
+	assert_eq!(s.consume(&spend_now("a"), now).await.unwrap(), Replayed);
+	// Released, the use is back; committed, it is gone.
+	assert_eq!(s.release("r1", now).await.unwrap(), SettleOutcome::Settled);
+	assert_eq!(s.release("r1", now).await.unwrap(), SettleOutcome::Unknown);
+	assert_eq!(
+		s.consume(&reserve("a", None, "r3", 60), now).await.unwrap(),
+		Consumed
+	);
+	assert_eq!(s.commit("r3", now).await.unwrap(), SettleOutcome::Settled);
+	assert_eq!(s.commit("r3", now).await.unwrap(), SettleOutcome::Unknown);
+	assert_eq!(
+		s.consume(&reserve("a", None, "r4", 60), now).await.unwrap(),
+		Replayed
+	);
+
+	// A reserved challenge cannot be answered again until settled; a release keeps it, a
+	// commit spends it.
+	let record = ChallengeRecord {
+		tool: TOOL.into(),
+		intent_hash: "sha256:x".into(),
+		expires_at: now + 300,
+	};
+	s.put_challenge("c1", &record, now).await.unwrap();
+	assert_eq!(
+		s.consume(&reserve("b", Some("c1"), "r5", 60), now)
+			.await
+			.unwrap(),
+		Consumed
+	);
+	assert_eq!(
+		s.consume(&reserve("c", Some("c1"), "r6", 60), now)
+			.await
+			.unwrap(),
+		ChallengeGone
+	);
+	assert_eq!(s.release("r5", now).await.unwrap(), SettleOutcome::Settled);
+	assert!(s.get_challenge("c1", now).await.unwrap().is_some());
+	assert_eq!(
+		s.consume(&reserve("d", Some("c1"), "r7", 60), now)
+			.await
+			.unwrap(),
+		Consumed
+	);
+	assert_eq!(s.commit("r7", now).await.unwrap(), SettleOutcome::Settled);
+	assert_eq!(s.get_challenge("c1", now).await.unwrap(), None);
+
+	// No limit: nothing is counted, but the reservation still settles.
+	let unlimited = Consume {
+		max_uses: None,
+		..reserve("e", None, "r8", 60)
+	};
+	assert_eq!(s.consume(&unlimited, now).await.unwrap(), Consumed);
+	assert_eq!(
+		s.consume(
+			&Consume {
+				reservation: Some(crate::store::Reservation {
+					id: "r9".into(),
+					expires_at: now + 60
+				}),
+				..unlimited.clone()
+			},
+			now
+		)
+		.await
+		.unwrap(),
+		Consumed
+	);
+	assert_eq!(s.commit("r8", now).await.unwrap(), SettleOutcome::Settled);
+
+	// An unsettled reservation lapses, and the approval is usable again.
+	assert_eq!(
+		s.consume(&reserve("f", None, "r10", 1), now).await.unwrap(),
+		Consumed
+	);
+	tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+	let later = now + 2;
+	assert_eq!(
+		s.commit("r10", later).await.unwrap(),
+		SettleOutcome::Unknown
+	);
+	assert_eq!(
+		s.consume(&reserve("f", None, "r11", 60), later)
+			.await
+			.unwrap(),
+		Consumed
+	);
+}
+
+#[tokio::test]
+async fn the_memory_store_keeps_the_reservation_contract() {
+	reservation_contract(&StateStore::memory(), wall_clock()).await;
+}
+
+pub(crate) fn wall_clock() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_secs()
+}
+
+// ------------------------------------------------------------------ spend on success
+
+fn success_policy(ttl_secs: u64) -> ToolPolicy {
+	let mut p = policy("HAPS-PoHP-2");
+	p.spend_on = SpendOn::Success { ttl_secs };
+	p
+}
+
+const OK_RESULT: &[u8] = br#"{"content":[{"type":"text","text":"done"}]}"#;
+const ERROR_RESULT: &[u8] =
+	br#"{"content":[{"type":"text","text":"upstream refused"}],"isError":true}"#;
+
+#[tokio::test]
+async fn spending_on_success_reserves_the_use_until_the_tool_succeeds() {
+	let w = World::new();
+	let g = w.guard(success_policy(60));
+	let params = approved_call(&w.sign(&w.claims()));
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	let id = audit.reservation_id.expect("a reserved use");
+	// While the call is in flight, the approval cannot run a second call.
+	assert_eq!(denied(check(&g, &params, NOW).await), Denial::Replayed);
+	assert_eq!(g.settle(&id, OK_RESULT, NOW + 1).await, Settlement::Spent);
+	assert_eq!(denied(check(&g, &params, NOW + 2).await), Denial::Replayed);
+}
+
+#[tokio::test]
+async fn a_failed_tool_gives_the_use_back() {
+	let w = World::new();
+	let g = w.guard(success_policy(60));
+	let params = approved_call(&w.sign(&w.claims()));
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	assert_eq!(
+		g.settle(&audit.reservation_id.unwrap(), ERROR_RESULT, NOW + 1)
+			.await,
+		Settlement::Released
+	);
+	let (_, again) = approved(check(&g, &params, NOW + 2).await);
+	assert_eq!(
+		g.settle(&again.reservation_id.unwrap(), OK_RESULT, NOW + 3)
+			.await,
+		Settlement::Spent
+	);
+	assert_eq!(denied(check(&g, &params, NOW + 4).await), Denial::Replayed);
+}
+
+#[tokio::test]
+async fn an_unreadable_result_is_treated_as_success() {
+	let w = World::new();
+	let g = w.guard(success_policy(60));
+	let params = approved_call(&w.sign(&w.claims()));
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	assert_eq!(
+		g.settle(&audit.reservation_id.unwrap(), b"not json", NOW + 1)
+			.await,
+		Settlement::Spent
+	);
+	assert_eq!(denied(check(&g, &params, NOW + 2).await), Denial::Replayed);
+}
+
+#[tokio::test]
+async fn an_unsettled_reservation_lapses() {
+	// The documented price of spending on success: a result that never arrives lets the
+	// approval be used again once the reservation lapses.
+	let w = World::new();
+	let g = w.guard(success_policy(10));
+	let params = approved_call(&w.sign(&w.claims()));
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	assert!(is_approved(&check(&g, &params, NOW + 11).await));
+	assert_eq!(
+		g.settle(&audit.reservation_id.unwrap(), OK_RESULT, NOW + 12)
+			.await,
+		Settlement::Unknown
+	);
+}
+
+#[tokio::test]
+async fn spending_on_forward_reserves_nothing() {
+	let w = World::new();
+	let g = w.guard(policy("HAPS-PoHP-2"));
+	let (_, audit) = approved(check(&g, &approved_call(&w.sign(&w.claims())), NOW).await);
+	assert_eq!(audit.reservation_id, None);
+}
+
+#[tokio::test]
+async fn a_challenge_answered_under_spend_on_success_is_spent_only_on_success() {
+	let w = World::new();
+	let mut p = challenge_policy();
+	p.spend_on = SpendOn::Success { ttl_secs: 60 };
+	let g = w.guard(p);
+	let args = approved_arguments();
+	let ch = challenge_for(&g, &args, NOW).await;
+	let (credential, intent) = answer(&w, &ch, "jti-s1");
+	let params = call(
+		TOOL,
+		args.clone(),
+		Some(meta_for(&credential, &intent, None)),
+	);
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	g.settle(&audit.reservation_id.unwrap(), ERROR_RESULT, NOW)
+		.await;
+	// Released: the same challenge can be answered again.
+	let (credential, intent) = answer(&w, &ch, "jti-s2");
+	let params = call(TOOL, args, Some(meta_for(&credential, &intent, None)));
+	let (_, audit) = approved(check(&g, &params, NOW).await);
+	assert_eq!(
+		g.settle(&audit.reservation_id.unwrap(), OK_RESULT, NOW)
+			.await,
+		Settlement::Spent
+	);
 }
 
 mod redis_store;

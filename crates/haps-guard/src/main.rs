@@ -10,9 +10,10 @@ use anyhow::{Context, bail};
 use haps_guard::certification::CertificationConfig;
 use haps_guard::envelope::{EnvelopeRule, Pointer, RuleKind};
 use haps_guard::server::HapsGuardService;
-use haps_guard::store::StateStore;
+use haps_guard::store::{RedisOptions, RedisTopology, StateStore};
 use haps_guard::{
-	ArgumentBinding, ChallengeDisplay, Guard, GuardConfig, Party, PohpLevel, RpSigner, ToolPolicy,
+	ArgumentBinding, ChallengeDisplay, Guard, GuardConfig, Party, PohpLevel, RpSigner, SpendOn,
+	ToolPolicy,
 };
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::jwk::JwkSet;
@@ -80,13 +81,42 @@ enum StateConfig {
 	/// Atomic within one process. Fine for a single replica.
 	#[default]
 	Memory,
-	/// Shared by every replica pointed at the same Redis.
+	/// Shared by every replica pointed at the same Redis. Exactly one of `url` (a single
+	/// node), `nodes` (a Cluster) or `sentinels` with `service` (Sentinel).
 	#[serde(rename_all = "camelCase")]
 	Redis {
-		url: String,
+		#[serde(default)]
+		url: Option<String>,
+		#[serde(default)]
+		nodes: Option<Vec<String>>,
+		#[serde(default)]
+		sentinels: Option<Vec<String>>,
+		#[serde(default)]
+		service: Option<String>,
 		#[serde(default = "default_prefix")]
 		key_prefix: String,
+		/// Replicas that must confirm each spend before an approval is honoured.
+		#[serde(default)]
+		min_replica_acks: u32,
+		#[serde(default = "default_ack_timeout")]
+		replica_ack_timeout_ms: u64,
 	},
+}
+
+fn default_ack_timeout() -> u64 {
+	500
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+enum SpendOnConfig {
+	#[default]
+	Forward,
+	Success,
+}
+
+fn default_reservation_ttl() -> u64 {
+	120
 }
 
 #[derive(Deserialize)]
@@ -110,6 +140,13 @@ struct ToolConfig {
 	challenge_mode: bool,
 	#[serde(default)]
 	display: Option<DisplayConfig>,
+	/// `forward` (default) or `success`.
+	#[serde(default)]
+	spend_on: SpendOnConfig,
+	/// With `spendOn: success`: how long a reserved use waits for the tool's result. Longer
+	/// than the tool can take, or a slow success lapses into a reusable approval.
+	#[serde(default = "default_reservation_ttl")]
+	reservation_ttl_seconds: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -233,6 +270,12 @@ async fn main() -> anyhow::Result<()> {
 		policy.max_credential_age_secs = t.max_credential_age_seconds;
 		policy.allow_multi_use = t.allow_multi_use;
 		policy.challenge_mode = t.challenge_mode;
+		policy.spend_on = match t.spend_on {
+			SpendOnConfig::Forward => SpendOn::Forward,
+			SpendOnConfig::Success => SpendOn::Success {
+				ttl_secs: t.reservation_ttl_seconds,
+			},
+		};
 		if let Some(d) = t.display {
 			policy.display = ChallengeDisplay {
 				title: d.title,
@@ -259,10 +302,41 @@ async fn main() -> anyhow::Result<()> {
 		.collect::<anyhow::Result<_>>()?;
 	let store = match &config.state {
 		StateConfig::Memory => StateStore::memory(),
-		StateConfig::Redis { url, key_prefix } => StateStore::redis(url, key_prefix)
+		StateConfig::Redis {
+			url,
+			nodes,
+			sentinels,
+			service,
+			key_prefix,
+			min_replica_acks,
+			replica_ack_timeout_ms,
+		} => {
+			let topology = match (url, nodes, sentinels, service) {
+				(Some(url), None, None, None) => RedisTopology::Single { url: url.clone() },
+				(None, Some(nodes), None, None) if !nodes.is_empty() => RedisTopology::Cluster {
+					nodes: nodes.clone(),
+				},
+				(None, None, Some(sentinels), Some(service)) if !sentinels.is_empty() => {
+					RedisTopology::Sentinel {
+						sentinels: sentinels.clone(),
+						service: service.clone(),
+					}
+				},
+				_ => bail!("state: give exactly one of url, nodes, or sentinels with service"),
+			};
+			if !key_prefix.contains('{') || !key_prefix.contains('}') {
+				bail!("state.keyPrefix must contain a {{hash tag}}, so every key shares a Cluster slot");
+			}
+			StateStore::redis(RedisOptions {
+				topology,
+				prefix: key_prefix.clone(),
+				min_replica_acks: *min_replica_acks,
+				replica_ack_timeout_ms: *replica_ack_timeout_ms,
+			})
 			.await
 			.map_err(|e| anyhow::anyhow!("{e}"))
-			.context("connecting to the Redis state store")?,
+			.context("connecting to the Redis state store")?
+		},
 	};
 
 	let guard = Guard::new(

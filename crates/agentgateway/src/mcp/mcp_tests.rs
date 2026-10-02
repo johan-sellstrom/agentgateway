@@ -8186,6 +8186,63 @@ async fn haps_guard_challenge_mode_end_to_end() {
 	);
 }
 
+/// Spend on success (haps-guard `SpendOn::Success`) through a real gateway: the guard reserves
+/// the approval's use, the gateway brings the reservation back with the response, and the use
+/// is spent only then. Spent, it stays spent past the point where an unsettled reservation would
+/// have lapsed; that is what shows the response hook did the settling.
+#[tokio::test]
+async fn haps_guard_spends_on_success_through_the_response_hook() {
+	use haps_guard::server::{HapsGuardService, RESERVATION_METADATA_KEY};
+	use haps_guard::{PohpLevel, SpendOn, ToolPolicy};
+	use protos::ext_mcp::ext_mcp_server::ExtMcpServer;
+	use serde_json::json;
+
+	let w = HapsWorld::new();
+	let mut policy = ToolPolicy::new("demo.echo", PohpLevel::parse("HAPS-PoHP-2").unwrap());
+	policy.spend_on = SpendOn::Success { ttl_secs: 1 };
+	let guard = w.guard(HashMap::from([("echo".to_owned(), policy)]));
+	let guard_srv =
+		crate::test_helpers::spawn_service(ExtMcpServer::new(HapsGuardService::new(guard))).await;
+	let mock = mock_streamable_http_server(true).await;
+	let metadata = HashMap::from([(
+		RESERVATION_METADATA_KEY.to_owned(),
+		Arc::new(cel::Expression::new_strict("mcpGuardrails.haps.reservation").unwrap()),
+	)]);
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy_with(
+			guard_srv.address,
+			guardrails::FailureMode::FailClosed,
+			guardrails_test_support::default_methods(),
+			metadata,
+		)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+	let args = json!({"msg": "send the report"});
+	let approved = w.approved_meta("jti-1", &w.intent("demo.echo", &args), None);
+
+	let result = client
+		.call_tool(haps_call("echo", &args, Some(&approved)))
+		.await
+		.expect("an approved call reaches the tool");
+	assert_ne!(result.is_error, Some(true), "{result:?}");
+
+	// Past the reservation's lifetime. Had the response not settled it, the reservation would
+	// have lapsed and the approval would run the tool again.
+	tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+	let result = client
+		.call_tool(haps_call("echo", &args, Some(&approved)))
+		.await
+		.expect("a denial is a tool result the model can read");
+	assert!(
+		haps_denial_text(&result).contains("already been used"),
+		"{result:?}"
+	);
+}
+
 /// A processor that returns an empty `_meta` has cleared it, and nothing of the original may
 /// reach the upstream. The haps-guard relies on this when an approval was all `_meta` held.
 /// It needs a mock processor: through the rmcp client `_meta` always carries a progress token,

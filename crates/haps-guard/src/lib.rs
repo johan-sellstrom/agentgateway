@@ -25,7 +25,7 @@
 //! | RP-CORE-04a fractional numbers | rejected by the strict parser, for intent, view and arguments |
 //! | RP-CORE-05 `presentation_hash` | recomputed from the Signing View the guard derives from the intent (see [`derive_signing_view`]) |
 //! | RP-CORE-06 PoHP level and certification | minimum level; HAPS-PCC verified against trusted certifiers, see [`certification`] |
-//! | RP-CORE-07 one-time `jti` | atomic consume; in-memory, or Redis shared across replicas; `oneTime`/`maxUses` honoured when the tool allows multi-use |
+//! | RP-CORE-07 one-time `jti` | atomic consume; in-memory, or Redis (single node, Cluster, Sentinel) shared across replicas, with optional replica acknowledgement; spent on forwarding or, per tool, on success; `oneTime`/`maxUses` honoured when the tool allows multi-use |
 //! | RP-CORE-08 envelope constraints | enforced with a guard-defined vocabulary, see [`envelope`]; a member the guard cannot enforce is refused |
 //! | RP-CORE-09 challenge mode | per tool: the guard issues the HAPS-CHAL, optionally signed (`rpProof`), and consumes `challengeId` atomically with the `jti` |
 //! | RP-CORE-10 replay retention | until `exp + skew` |
@@ -65,7 +65,9 @@ use serde_json::value::RawValue;
 use crate::certification::{CertificationConfig, CertificationError, ProviderCertification};
 use crate::envelope::{EnvelopeError, EnvelopeRule};
 use crate::jws::JwsError;
-use crate::store::{ChallengeRecord, Consume, ConsumeOutcome, StateStore};
+use crate::store::{
+	ChallengeRecord, Consume, ConsumeOutcome, Reservation, SettleOutcome, StateStore,
+};
 
 /// `_meta` keys the guard reads, and strips before the call is forwarded upstream.
 pub const META_CREDENTIAL: &str = "haps/credential";
@@ -153,6 +155,23 @@ pub struct ToolPolicy {
 	/// RP-CORE-09: accept only credentials answering a challenge this guard issued.
 	pub challenge_mode: bool,
 	pub display: ChallengeDisplay,
+	/// When the approval's use is spent; see [`SpendOn`].
+	pub spend_on: SpendOn,
+}
+
+/// When an approved call's use of its approval is spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendOn {
+	/// When the call is forwarded. A tool that then fails has still used the approval. Never
+	/// lets one approval run a tool twice.
+	Forward,
+	/// When the tool succeeds. The use is reserved on forwarding and settled from the response:
+	/// spent on success, given back on an error result. A reservation that is never settled --
+	/// an upstream error, a timeout, a crashed gateway -- lapses after `ttl_secs` and the
+	/// approval becomes usable again, so a tool that ran but whose result was lost can run a
+	/// second time. Needs the gateway to send `mcpGuardrails.haps.reservation` back as response
+	/// metadata under the key [`server::RESERVATION_METADATA_KEY`].
+	Success { ttl_secs: u64 },
 }
 
 impl ToolPolicy {
@@ -168,6 +187,7 @@ impl ToolPolicy {
 			max_credential_age_secs: None,
 			allow_multi_use: false,
 			challenge_mode: false,
+			spend_on: SpendOn::Forward,
 			display: ChallengeDisplay::default(),
 		}
 	}
@@ -389,6 +409,9 @@ pub struct Audit {
 	/// The envelope members the call's arguments were allowed to vary in; empty for an exact
 	/// match.
 	pub varied_within_envelope: Vec<String>,
+	/// Set when the use is reserved rather than spent ([`SpendOn::Success`]): the id the
+	/// response must bring back to settle it.
+	pub reservation_id: Option<String>,
 }
 
 pub struct Guard {
@@ -620,6 +643,13 @@ impl Guard {
 			max_uses,
 			retain_until: claims.exp.saturating_add(skew),
 			challenge_id: claims.challenge_id.clone(),
+			reservation: match policy.spend_on {
+				SpendOn::Forward => None,
+				SpendOn::Success { ttl_secs } => Some(Reservation {
+					id: uuid::Uuid::new_v4().to_string(),
+					expires_at: now.saturating_add(ttl_secs),
+				}),
+			},
 		};
 		match self.store.consume(&consume, now).await {
 			Ok(ConsumeOutcome::Consumed) => {},
@@ -639,7 +669,35 @@ impl Guard {
 			evaluation: certified.evaluation,
 			challenge_id: claims.challenge_id,
 			varied_within_envelope: varied.iter().map(ToString::to_string).collect(),
+			reservation_id: consume.reservation.map(|r| r.id),
 		})
+	}
+
+	/// Settle a reserved use from the tool's response ([`SpendOn::Success`]): spend it if the
+	/// tool succeeded, give it back if the result is an error. `result` is the JSON-RPC `result`
+	/// of the `tools/call`. A result the guard cannot read is treated as success: the safe
+	/// direction is to spend.
+	pub async fn settle(&self, reservation_id: &str, result: &[u8], now: u64) -> Settlement {
+		#[derive(Deserialize)]
+		struct ToolResult {
+			#[serde(rename = "isError", default)]
+			is_error: Option<bool>,
+		}
+		let failed = serde_json::from_slice::<ToolResult>(result)
+			.ok()
+			.and_then(|r| r.is_error)
+			.unwrap_or(false);
+		let outcome = if failed {
+			self.store.release(reservation_id, now).await
+		} else {
+			self.store.commit(reservation_id, now).await
+		};
+		match outcome {
+			Ok(SettleOutcome::Settled) if failed => Settlement::Released,
+			Ok(SettleOutcome::Settled) => Settlement::Spent,
+			Ok(SettleOutcome::Unknown) => Settlement::Unknown,
+			Err(e) => Settlement::Failed(e.to_string()),
+		}
 	}
 
 	fn agent_resistant_eligible(&self, method: &str) -> bool {
@@ -828,6 +886,16 @@ pub fn derive_signing_view(intent: &Canon) -> Canon {
 		),
 		other => other.clone(),
 	}
+}
+
+/// What settling a reserved use did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settlement {
+	Spent,
+	Released,
+	/// Already settled, lapsed, or never reserved.
+	Unknown,
+	Failed(String),
 }
 
 enum Verdict {
