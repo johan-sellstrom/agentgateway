@@ -27,6 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 # The shared replay and challenge store. Optional at runtime: the in-memory store needs none.
+reqwest = { workspace = true, features = ["json"] }
 redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager", "cluster-async", "sentinel"] }
 
 # The HAPS canonicalizer and hash, from the public HAPS reference repository at a pinned

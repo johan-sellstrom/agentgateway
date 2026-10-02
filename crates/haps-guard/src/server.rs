@@ -38,9 +38,23 @@ impl HapsGuardService {
 	/// Decide one request against an explicit clock; the RPC handler passes the real one.
 	pub async fn decide(&self, req: &McpRequest, now: u64) -> McpRequestResult {
 		let tool = tool_name(req);
+		// The gateway's metadata for this call, as JSON: where the caller's account comes from.
+		let metadata = req
+			.metadata_context
+			.as_ref()
+			.and_then(|m| serde_json::to_value(m).ok())
+			.and_then(|v| match v {
+				serde_json::Value::Object(m) => Some(m),
+				_ => None,
+			});
 		match self
 			.guard
-			.check(&req.method, req.mcp_request.as_deref(), now)
+			.check_with(
+				&req.method,
+				req.mcp_request.as_deref(),
+				metadata.as_ref(),
+				now,
+			)
 			.await
 		{
 			Decision::NotGated => pass(),
@@ -177,6 +191,11 @@ fn audit_metadata(audit: &crate::Audit) -> Option<prost_wkt_types::Struct> {
 			"challengeId": audit.challenge_id,
 			"variedWithinEnvelope": audit.varied_within_envelope,
 			"reservation": audit.reservation_id,
+			"identity": audit.identity.as_ref().map(|b| serde_json::json!({
+				"scheme": b.scheme,
+				"subject": b.subject,
+				"reverified": b.reverified,
+			})),
 		}
 	}))
 	.ok()

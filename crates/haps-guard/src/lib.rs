@@ -42,6 +42,7 @@
 
 pub mod certification;
 pub mod envelope;
+pub mod identity;
 mod jws;
 pub mod server;
 pub mod store;
@@ -64,6 +65,7 @@ use serde_json::value::RawValue;
 
 use crate::certification::{CertificationConfig, CertificationError, ProviderCertification};
 use crate::envelope::{EnvelopeError, EnvelopeRule};
+use crate::identity::{ApprovalContext, Bound, IdentityError, IdentityPolicy, IdentityTrust};
 use crate::jws::JwsError;
 use crate::store::{
 	ChallengeRecord, Consume, ConsumeOutcome, Reservation, SettleOutcome, StateStore,
@@ -157,6 +159,8 @@ pub struct ToolPolicy {
 	pub display: ChallengeDisplay,
 	/// When the approval's use is spent; see [`SpendOn`].
 	pub spend_on: SpendOn,
+	/// HAPS-RP-ID-0.4: whose approval this tool requires. `None` ignores identity bindings.
+	pub identity: Option<IdentityPolicy>,
 }
 
 /// When an approved call's use of its approval is spent.
@@ -188,6 +192,7 @@ impl ToolPolicy {
 			allow_multi_use: false,
 			challenge_mode: false,
 			spend_on: SpendOn::Forward,
+			identity: None,
 			display: ChallengeDisplay::default(),
 		}
 	}
@@ -229,6 +234,8 @@ pub struct GuardConfig {
 	pub agent_resistant_methods: Vec<String>,
 	pub challenge_ttl_secs: u64,
 	pub rp_signer: Option<RpSigner>,
+	/// Keys and issuers trusted for identity evidence.
+	pub identity: IdentityTrust,
 }
 
 /// Why a presented approval was refused. Each maps to the requirement it enforces.
@@ -281,6 +288,8 @@ pub enum Denial {
 	ChallengeMismatch,
 	/// RP-CORE-07.
 	Replayed,
+	/// HAPS-RP-ID-0.4.
+	Identity(IdentityError),
 	/// Challenge mode could not build an intent for this call.
 	ChallengeUnbuildable(String),
 	/// The state store failed. The guard fails closed.
@@ -340,6 +349,7 @@ impl fmt::Display for Denial {
 				"approval assurance {presented} is below the required {required}"
 			),
 			Denial::Certification(e) => write!(f, "{e}"),
+			Denial::Identity(e) => write!(f, "{e}"),
 			Denial::FactorNotAccepted(m) => {
 				write!(f, "approval factor {m} is not accepted for this tool")
 			},
@@ -384,7 +394,7 @@ pub enum Decision {
 	/// Not a gated call: forward it untouched.
 	NotGated,
 	/// Approved. Forward `params`, from which the HAPS `_meta` keys have been removed.
-	Approved { params: Vec<u8>, audit: Audit },
+	Approved { params: Vec<u8>, audit: Box<Audit> },
 	/// No usable approval: ask the host to send the human to the Presence Provider.
 	ElicitationRequired {
 		reason: String,
@@ -412,6 +422,8 @@ pub struct Audit {
 	/// Set when the use is reserved rather than spent ([`SpendOn::Success`]): the id the
 	/// response must bring back to settle it.
 	pub reservation_id: Option<String>,
+	/// The checked identity binding, if the tool has an identity policy and one was presented.
+	pub identity: Option<Bound>,
 }
 
 pub struct Guard {
@@ -426,6 +438,18 @@ impl Guard {
 
 	/// Decide one request. `now` is seconds since the Unix epoch.
 	pub async fn check(&self, method: &str, raw_params: Option<&[u8]>, now: u64) -> Decision {
+		self.check_with(method, raw_params, None, now).await
+	}
+
+	/// Decide one request, with the gateway's metadata for it: the caller's account, for
+	/// identity binding (RP-IDB-03).
+	pub async fn check_with(
+		&self,
+		method: &str,
+		raw_params: Option<&[u8]>,
+		metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+		now: u64,
+	) -> Decision {
 		if method != "tools/call" {
 			return Decision::NotGated;
 		}
@@ -463,6 +487,7 @@ impl Guard {
 				.await;
 		};
 		let presented = Presented {
+			metadata,
 			tool: &call.name,
 			credential: &credential,
 			intent: intent.get(),
@@ -471,7 +496,10 @@ impl Guard {
 		};
 		match self.verify(policy, presented, now).await {
 			Ok(audit) => match strip_haps_meta(raw) {
-				Ok(params) => Decision::Approved { params, audit },
+				Ok(params) => Decision::Approved {
+					params,
+					audit: Box::new(audit),
+				},
 				Err(e) => Decision::Denied(Denial::MalformedParams(e)),
 			},
 			Err(Verdict::Elicit(reason)) => {
@@ -592,6 +620,33 @@ impl Guard {
 		)
 		.map_err(|e| deny(Denial::Certification(e)))?;
 
+		// HAPS-RP-ID-0.4.
+		let identity = match &policy.identity {
+			None => None,
+			Some(ip) => identity::check(
+				&self.config.identity,
+				ip,
+				policy.min_level >= PohpLevel(3),
+				claims.identity_binding.as_ref(),
+				&ApprovalContext {
+					cc_issuer: &claims.issuer,
+					cc_iat: claims.iat,
+					intent_hash: &claims.intent_hash,
+					challenge_id: claims.challenge_id.as_deref(),
+					audience: &self.config.audience.id,
+					skew,
+				},
+				p.metadata,
+			)
+			.map_err(|e| match e {
+				// No binding is not an attack: ask for an approval that carries one.
+				IdentityError::Missing => {
+					Verdict::Elicit("this tool requires an approval bound to your identity")
+				},
+				e => deny(Denial::Identity(e)),
+			})?,
+		};
+
 		// The binding a gateway cannot supply on its own, and RP-CORE-08.
 		let empty = Canon::Object(Vec::new());
 		let approved = fields.parameters.unwrap_or(&empty);
@@ -670,6 +725,7 @@ impl Guard {
 			challenge_id: claims.challenge_id,
 			varied_within_envelope: varied.iter().map(ToString::to_string).collect(),
 			reservation_id: consume.reservation.map(|r| r.id),
+			identity,
 		})
 	}
 
@@ -812,11 +868,30 @@ impl Guard {
 		if let Some(max) = policy.max_credential_age_secs {
 			pohp["maxCredentialAgeSeconds"] = max.into();
 		}
+		let mut requirements = serde_json::json!({"pohp": pohp});
+		if let Some(ip) = &policy.identity {
+			// What the Presence Provider must satisfy (`haps-v0.4.0.md` §9.1). The evidence's
+			// nonce is this challenge's id; see the identity module.
+			let mut idp_policy = serde_json::json!({
+				"requireEmbeddedEvidence": ip.require_embedded_evidence || policy.min_level >= PohpLevel(3),
+			});
+			if !ip.google_domains.is_empty() {
+				idp_policy["allowedDomains"] = ip.google_domains.clone().into();
+			}
+			if let Some(claim) = &ip.eudi_subject_claim {
+				idp_policy["requiredClaims"] = vec![claim.clone()].into();
+			}
+			requirements["identity"] = serde_json::json!({
+				"mode": if ip.required { "required" } else { "preferred" },
+				"schemes": ip.schemes.iter().map(|s| s.wire_name()).collect::<Vec<_>>(),
+				"policy": idp_policy,
+			});
+		}
 		let mut challenge = serde_json::json!({
 			"version": "0.4",
 			"challengeId": challenge_id,
 			"expiresAt": timestamp(expires_at)?,
-			"requirements": {"pohp": pohp},
+			"requirements": requirements,
 			"actionIntent": intent,
 		});
 		if let Some(signer) = &self.config.rp_signer {
@@ -904,6 +979,7 @@ enum Verdict {
 }
 
 struct Presented<'a> {
+	metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
 	tool: &'a str,
 	credential: &'a str,
 	intent: &'a str,
@@ -1058,6 +1134,8 @@ struct Claims {
 	provider_certification: ProviderCertification,
 	#[serde(rename = "challengeId", default)]
 	challenge_id: Option<String>,
+	#[serde(rename = "identityBinding", default)]
+	identity_binding: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]

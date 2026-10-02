@@ -1,0 +1,25 @@
+[package]
+name = "haps-guard-eudi-wallet-interop"
+description = "Interop test: EUWallet's own OpenID4VP machine presents to haps-guard's SD-JWT VC verifier"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, deliberately outside agentgateway's: EUWallet is a private repository, and
+# a git dependency anywhere in agentgateway's lockfile would make every build of the gateway need
+# access to it. Run with `cargo test` from this directory, with SSH access to advatar/EUWallet.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+haps-guard = { path = "../../crates/haps-guard" }
+# EUWallet at a pinned commit: the wallet's sans-IO OpenID4VP state machine, its software
+# signer and crypto backend, and its own SD-JWT verifier for a cross-check.
+oid4vp = { git = "ssh://git@github.com/advatar/EUWallet.git", rev = "7d45472179bab19c5bd91c8b0828869e3b25696c" }
+sdjwt = { git = "ssh://git@github.com/advatar/EUWallet.git", rev = "7d45472179bab19c5bd91c8b0828869e3b25696c" }
+crypto-traits = { git = "ssh://git@github.com/advatar/EUWallet.git", rev = "7d45472179bab19c5bd91c8b0828869e3b25696c" }
+crypto-backend = { git = "ssh://git@github.com/advatar/EUWallet.git", rev = "7d45472179bab19c5bd91c8b0828869e3b25696c" }
+base64 = "0.22"
+serde_json = "1"
+jsonwebtoken = "11"

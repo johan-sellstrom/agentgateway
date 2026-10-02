@@ -5,10 +5,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use haps_guard::certification::CertificationConfig;
 use haps_guard::envelope::{EnvelopeRule, Pointer, RuleKind};
+use haps_guard::identity::{
+	CredentialIssuer, EudiTrust, GoogleTrust, IdentityPolicy, IdentityTrust, KeySource, Scheme,
+};
 use haps_guard::server::HapsGuardService;
 use haps_guard::store::{RedisOptions, RedisTopology, StateStore};
 use haps_guard::{
@@ -45,7 +49,90 @@ struct Config {
 	agent_resistant_methods: Vec<String>,
 	#[serde(default)]
 	state: StateConfig,
+	/// Trust for identity evidence (HAPS-RP-ID-0.4).
+	#[serde(default)]
+	identity: IdentityTrustConfig,
 	tools: HashMap<String, ToolConfig>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdentityTrustConfig {
+	#[serde(default)]
+	google: Option<GoogleConfig>,
+	#[serde(default)]
+	eudi: Option<EudiConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GoogleConfig {
+	/// The Presence Providers' Google OAuth client ids.
+	client_ids: Vec<String>,
+	/// Google's keys as a JWKS file, and/or a URL to fetch them from and refresh hourly
+	/// (normally https://www.googleapis.com/oauth2/v3/certs). Google rotates its keys, so a
+	/// file alone goes stale.
+	#[serde(default)]
+	jwks_file: Option<PathBuf>,
+	#[serde(default)]
+	jwks_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EudiConfig {
+	/// Trusted credential issuers, by `iss`.
+	issuers: HashMap<String, CredentialIssuerConfig>,
+	/// HAPS issuer → the OpenID4VP client_id its key-binding JWTs name.
+	#[serde(default)]
+	verifier_client_ids: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialIssuerConfig {
+	jwks: PathBuf,
+	vcts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolIdentityConfig {
+	mode: IdentityModeConfig,
+	schemes: Vec<SchemeConfig>,
+	/// The gateway metadata key holding the caller's account identity. Required: an identity
+	/// that is not matched against the caller only says that *someone* approved.
+	account_attribute: String,
+	#[serde(default)]
+	require_verified: bool,
+	#[serde(default)]
+	require_embedded_evidence: bool,
+	#[serde(default)]
+	eudi_subject_claim: Option<String>,
+	#[serde(default)]
+	google_domains: Vec<String>,
+	#[serde(default)]
+	max_auth_age_seconds: Option<u64>,
+	#[serde(default = "default_evidence_age")]
+	max_evidence_age_seconds: u64,
+}
+
+fn default_evidence_age() -> u64 {
+	300
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum IdentityModeConfig {
+	Required,
+	Preferred,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum SchemeConfig {
+	EudiWallet,
+	Google,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +234,8 @@ struct ToolConfig {
 	/// than the tool can take, or a slow success lapses into a reusable approval.
 	#[serde(default = "default_reservation_ttl")]
 	reservation_ttl_seconds: u64,
+	#[serde(default)]
+	identity: Option<ToolIdentityConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -211,6 +300,54 @@ fn jwks_map(
 		.collect()
 }
 
+/// Google's keys: from the file, then from the URL, refreshed hourly in the background. A
+/// failed refresh keeps the last good keys.
+async fn google_keys(base: &Path, g: &GoogleConfig) -> anyhow::Result<Arc<KeySource>> {
+	let source = Arc::new(KeySource::default());
+	match (&g.jwks_file, &g.jwks_url) {
+		(None, None) => bail!("identity.google needs jwksFile, jwksUrl or both"),
+		(Some(file), _) => source.replace(
+			serde_json::from_str(&read(base, file)?)
+				.with_context(|| format!("parsing {} as a JWKS", file.display()))?,
+		),
+		(None, Some(_)) => {},
+	}
+	if let Some(url) = g.jwks_url.clone() {
+		let fetch = {
+			let url = url.clone();
+			move || {
+				let url = url.clone();
+				async move {
+					let keys: JwkSet = reqwest::get(&url).await?.error_for_status()?.json().await?;
+					anyhow::Ok(keys)
+				}
+			}
+		};
+		match fetch().await {
+			Ok(keys) => source.replace(keys),
+			Err(e) if g.jwks_file.is_some() => {
+				tracing::warn!(%url, error = %e, "haps-guard: Google keys not fetched; using jwksFile")
+			},
+			Err(e) => return Err(e.context(format!("fetching Google keys from {url}"))),
+		}
+		let refreshed = source.clone();
+		tokio::spawn(async move {
+			let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
+			every.tick().await;
+			loop {
+				every.tick().await;
+				match fetch().await {
+					Ok(keys) => refreshed.replace(keys),
+					Err(e) => {
+						tracing::warn!(error = %e, "haps-guard: Google key refresh failed; keeping the last keys")
+					},
+				}
+			}
+		});
+	}
+	Ok(source)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	tracing_subscriber::fmt::init();
@@ -270,6 +407,43 @@ async fn main() -> anyhow::Result<()> {
 		policy.max_credential_age_secs = t.max_credential_age_seconds;
 		policy.allow_multi_use = t.allow_multi_use;
 		policy.challenge_mode = t.challenge_mode;
+		if let Some(ic) = t.identity {
+			let embedded =
+				ic.require_embedded_evidence || min_level >= PohpLevel::parse("HAPS-PoHP-3").unwrap();
+			for scheme in &ic.schemes {
+				let configured = match scheme {
+					SchemeConfig::Google => config.identity.google.is_some(),
+					SchemeConfig::EudiWallet => config.identity.eudi.is_some(),
+				};
+				if embedded && !configured {
+					bail!(
+						"tool {name}: identity evidence must be re-verified, but identity.{} is not configured",
+						match scheme {
+							SchemeConfig::Google => "google",
+							SchemeConfig::EudiWallet => "eudi",
+						}
+					);
+				}
+			}
+			let mut ip = IdentityPolicy::new(
+				matches!(ic.mode, IdentityModeConfig::Required),
+				ic.schemes
+					.iter()
+					.map(|s| match s {
+						SchemeConfig::Google => Scheme::Google,
+						SchemeConfig::EudiWallet => Scheme::EudiWallet,
+					})
+					.collect(),
+			);
+			ip.account_attribute = Some(ic.account_attribute);
+			ip.require_verified = ic.require_verified;
+			ip.require_embedded_evidence = ic.require_embedded_evidence;
+			ip.eudi_subject_claim = ic.eudi_subject_claim;
+			ip.google_domains = ic.google_domains;
+			ip.max_auth_age_secs = ic.max_auth_age_seconds;
+			ip.max_evidence_age_secs = ic.max_evidence_age_seconds;
+			policy.identity = Some(ip);
+		}
 		policy.spend_on = match t.spend_on {
 			SpendOnConfig::Forward => SpendOn::Forward,
 			SpendOnConfig::Success => SpendOn::Success {
@@ -339,6 +513,37 @@ async fn main() -> anyhow::Result<()> {
 		},
 	};
 
+	let identity = IdentityTrust {
+		google: match &config.identity.google {
+			None => None,
+			Some(g) => Some(GoogleTrust {
+				client_ids: g.client_ids.clone(),
+				keys: google_keys(&base, g).await?,
+			}),
+		},
+		eudi: match &config.identity.eudi {
+			None => None,
+			Some(e) => Some(EudiTrust {
+				issuers: e
+					.issuers
+					.iter()
+					.map(|(iss, c)| {
+						let keys = serde_json::from_str(&read(&base, &c.jwks)?)
+							.with_context(|| format!("parsing {} as a JWKS", c.jwks.display()))?;
+						Ok((
+							iss.clone(),
+							CredentialIssuer {
+								keys,
+								vcts: c.vcts.clone(),
+							},
+						))
+					})
+					.collect::<anyhow::Result<_>>()?,
+				verifier_client_ids: e.verifier_client_ids.clone(),
+			}),
+		},
+	};
+
 	let guard = Guard::new(
 		GuardConfig {
 			tools,
@@ -361,6 +566,7 @@ async fn main() -> anyhow::Result<()> {
 			agent_resistant_methods: config.agent_resistant_methods,
 			challenge_ttl_secs: config.challenge_ttl_seconds,
 			rp_signer,
+			identity,
 		},
 		store,
 	);

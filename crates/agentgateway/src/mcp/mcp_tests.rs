@@ -7836,6 +7836,38 @@ impl HapsWorld {
 	const AUD: &str = "did:web:gateway.example";
 	const ISSUER: &str = "did:web:pp.example";
 	const CERTIFIER: &str = "did:web:certs.example";
+	const GOOGLE_CLIENT: &str = "pp-client.apps.googleusercontent.com";
+
+	/// A Google ID token for `email`, bound to the approval of `intent` through its nonce. The
+	/// signing key is the haps-guard test stand-in for Google's.
+	fn google_binding(&self, email: &str, intent: &serde_json::Value) -> serde_json::Value {
+		let token = Self::sign_rsa(&serde_json::json!({
+			"iss": "https://accounts.google.com",
+			"aud": Self::GOOGLE_CLIENT,
+			"sub": "1234567890",
+			"email": email,
+			"email_verified": true,
+			"nonce": Self::hash(intent),
+			"iat": self.now,
+			"exp": self.now + 3600,
+		}));
+		serde_json::json!({
+			"mode": "verified",
+			"scheme": "google_oidc",
+			"subject": {"type": "google_email", "email": email},
+			"evidence": {"embedded": true, "idToken": token},
+		})
+	}
+
+	fn sign_rsa(claims: &serde_json::Value) -> String {
+		let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+		header.kid = Some("google-test-1".into());
+		let key = jsonwebtoken::EncodingKey::from_rsa_pem(
+			include_str!("../../../haps-guard/testdata/identity/google-test-key.pem").as_bytes(),
+		)
+		.unwrap();
+		jsonwebtoken::encode(&header, claims, &key).unwrap()
+	}
 
 	fn new() -> Self {
 		use aws_lc_rs::rand::SystemRandom;
@@ -7898,6 +7930,18 @@ impl HapsWorld {
 				agent_resistant_methods: vec![],
 				challenge_ttl_secs: 300,
 				rp_signer: None,
+				identity: haps_guard::identity::IdentityTrust {
+					google: Some(haps_guard::identity::GoogleTrust {
+						client_ids: vec![Self::GOOGLE_CLIENT.into()],
+						keys: Arc::new(haps_guard::identity::KeySource::new(
+							serde_json::from_str(include_str!(
+								"../../../haps-guard/testdata/identity/google-test-jwks.json"
+							))
+							.unwrap(),
+						)),
+					}),
+					eudi: None,
+				},
 			},
 			StateStore::memory(),
 		)
@@ -7940,6 +7984,17 @@ impl HapsWorld {
 		intent: &serde_json::Value,
 		challenge_id: Option<&serde_json::Value>,
 	) -> serde_json::Value {
+		self.approved_meta_as(jti, intent, challenge_id, None)
+	}
+
+	/// As [`Self::approved_meta`], with an identity binding in the credential.
+	fn approved_meta_as(
+		&self,
+		jti: &str,
+		intent: &serde_json::Value,
+		challenge_id: Option<&serde_json::Value>,
+		identity: Option<&serde_json::Value>,
+	) -> serde_json::Value {
 		use haps_guard::{derive_signing_view, haps_canon, haps_hash};
 		let view = derive_signing_view(&haps_canon::parse(&intent.to_string()).unwrap());
 		let pcc = Self::sign(
@@ -7968,6 +8023,9 @@ impl HapsWorld {
 		});
 		if let Some(id) = challenge_id {
 			claims["challengeId"] = id.clone();
+		}
+		if let Some(b) = identity {
+			claims["identityBinding"] = b.clone();
 		}
 		let credential = Self::sign(&self.pp, "pp-1", &claims);
 		serde_json::json!({"haps/credential": credential, "haps/actionIntent": intent})
@@ -8239,6 +8297,76 @@ async fn haps_guard_spends_on_success_through_the_response_hook() {
 		.expect("a denial is a tool result the model can read");
 	assert!(
 		haps_denial_text(&result).contains("already been used"),
+		"{result:?}"
+	);
+}
+
+/// Identity binding (HAPS-RP-ID-0.4) through a real gateway: the operator maps the caller's
+/// account into guardrail metadata, and the guard admits an approval only if the identity that
+/// approved is that account. Here the account is a CEL literal standing in for an authenticated
+/// claim such as `jwt.email`.
+#[tokio::test]
+async fn haps_guard_matches_the_approving_identity_to_the_caller() {
+	use haps_guard::identity::{IdentityPolicy, Scheme};
+	use haps_guard::server::HapsGuardService;
+	use haps_guard::{PohpLevel, ToolPolicy};
+	use protos::ext_mcp::ext_mcp_server::ExtMcpServer;
+	use serde_json::json;
+
+	let w = HapsWorld::new();
+	let mut policy = ToolPolicy::new("demo.echo", PohpLevel::parse("HAPS-PoHP-2").unwrap());
+	let mut identity = IdentityPolicy::new(true, vec![Scheme::Google]);
+	identity.account_attribute = Some("account".into());
+	identity.require_embedded_evidence = true;
+	policy.identity = Some(identity);
+	let guard = w.guard(HashMap::from([("echo".to_owned(), policy)]));
+	let guard_srv =
+		crate::test_helpers::spawn_service(ExtMcpServer::new(HapsGuardService::new(guard))).await;
+	let mock = mock_streamable_http_server(true).await;
+	let metadata = HashMap::from([(
+		"account".to_owned(),
+		Arc::new(cel::Expression::new_strict(r#""alice@example.com""#).unwrap()),
+	)]);
+	let (_bind, io) = setup_proxy_policies(
+		&mock,
+		true,
+		false,
+		vec![guardrails_test_support::policy_with(
+			guard_srv.address,
+			guardrails::FailureMode::FailClosed,
+			guardrails_test_support::default_methods(),
+			metadata,
+		)],
+	)
+	.await;
+	let client = mcp_streamable_client(io).await;
+	let args = json!({"msg": "pay the invoice"});
+	let intent = w.intent("demo.echo", &args);
+
+	// Approved by Alice, called as Alice: the tool runs.
+	let alice = w.google_binding("alice@example.com", &intent);
+	let result = client
+		.call_tool(haps_call(
+			"echo",
+			&args,
+			Some(&w.approved_meta_as("jti-1", &intent, None, Some(&alice))),
+		))
+		.await
+		.expect("reaches the tool");
+	assert_ne!(result.is_error, Some(true), "{result:?}");
+
+	// Approved by Bob, called as Alice: refused, though Bob's approval is otherwise valid.
+	let bob = w.google_binding("bob@example.com", &intent);
+	let result = client
+		.call_tool(haps_call(
+			"echo",
+			&args,
+			Some(&w.approved_meta_as("jti-2", &intent, None, Some(&bob))),
+		))
+		.await
+		.expect("a denial is a tool result the model can read");
+	assert!(
+		haps_denial_text(&result).contains("not the account making this call"),
 		"{result:?}"
 	);
 }

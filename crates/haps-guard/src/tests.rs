@@ -148,6 +148,7 @@ impl World {
 			agent_resistant_methods: Vec::new(),
 			challenge_ttl_secs: 300,
 			rp_signer: None,
+			identity: crate::identity::IdentityTrust::default(),
 		}
 	}
 
@@ -235,7 +236,7 @@ async fn check(g: &Guard, params: &[u8], now: u64) -> Decision {
 
 fn approved(d: Decision) -> (Vec<u8>, Audit) {
 	match d {
-		Decision::Approved { params, audit } => (params, audit),
+		Decision::Approved { params, audit } => (params, *audit),
 		other => panic!("expected Approved, got {other:?}"),
 	}
 }
@@ -304,6 +305,7 @@ async fn a_credential_carrying_the_published_hashes_is_accepted() {
 			challenge_id: None,
 			varied_within_envelope: vec![],
 			reservation_id: None,
+			identity: None,
 		}
 	);
 	// The upstream receives exactly the approved arguments, and never the credential.
@@ -1783,4 +1785,5 @@ async fn a_challenge_answered_under_spend_on_success_is_spent_only_on_success() 
 	);
 }
 
+mod identity;
 mod redis_store;
