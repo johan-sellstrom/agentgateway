@@ -191,6 +191,7 @@ fn audit_metadata(audit: &crate::Audit) -> Option<prost_wkt_types::Struct> {
 			"challengeId": audit.challenge_id,
 			"variedWithinEnvelope": audit.varied_within_envelope,
 			"reservation": audit.reservation_id,
+			"format": audit.format,
 			"identity": audit.identity.as_ref().map(|b| serde_json::json!({
 				"scheme": b.scheme,
 				"subject": b.subject,

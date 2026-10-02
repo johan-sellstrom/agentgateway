@@ -31,8 +31,9 @@
 //! | RP-CORE-10 replay retention | until `exp + skew` |
 //! | FACTOR-RP-01..05 | accepted-method list; agent-accessible factors refused from PoHP-2 or on request; method in audit |
 //!
-//! Not implemented: identity binding (the separate HAPS-RP-ID-0.4 class), and the `vc+json`
-//! credential format. Where HAPS v0.4 leaves a choice open — the Signing View derivation, the
+//! Also implemented: identity binding (HAPS-RP-ID-0.4) with an EUDI wallet or a Google identity,
+//! see [`identity`]; and both credential formats, `jwt` and `vc+json` (Data Integrity
+//! `eddsa-jcs-2022` / `ecdsa-jcs-2019`), see [`vc`]. Where HAPS v0.4 leaves a choice open — the Signing View derivation, the
 //! envelope vocabulary, the PCC wire form — the guard's choice is documented where it is made,
 //! and is an interpretation, not specification text.
 //!
@@ -46,6 +47,7 @@ pub mod identity;
 mod jws;
 pub mod server;
 pub mod store;
+pub mod vc;
 
 /// Re-exported so a caller computing `intent_hash` or `presentation_hash` uses the same
 /// verified crates the guard checks against, rather than a second implementation.
@@ -424,6 +426,8 @@ pub struct Audit {
 	pub reservation_id: Option<String>,
 	/// The checked identity binding, if the tool has an identity policy and one was presented.
 	pub identity: Option<Bound>,
+	/// `jwt` or `vc+json`.
+	pub format: &'static str,
 }
 
 pub struct Guard {
@@ -486,6 +490,18 @@ impl Guard {
 				)
 				.await;
 		};
+		let credential = match credential.get().trim_start().as_bytes().first() {
+			Some(b'"') => match serde_json::from_str::<String>(credential.get()) {
+				Ok(jws) => Credential::Jwt(jws),
+				Err(e) => return Decision::Denied(Denial::MalformedCredential(e.to_string())),
+			},
+			Some(b'{') => Credential::Vc(credential.get()),
+			_ => {
+				return Decision::Denied(Denial::MalformedCredential(
+					"haps/credential is neither a JWS string nor a credential object".into(),
+				));
+			},
+		};
 		let presented = Presented {
 			metadata,
 			tool: &call.name,
@@ -518,11 +534,32 @@ impl Guard {
 		now: u64,
 	) -> Result<Audit, Verdict> {
 		let deny = Verdict::Deny;
-		// RP-CORE-01.
-		let claims = jws::verify::<Claims>(p.credential, &self.config.issuers, |c| &c.issuer)
-			.map_err(|e| deny(e.into()))?
-			.claims;
 		let skew = self.config.clock_skew_secs;
+		// RP-CORE-01, for either format.
+		let (claims, format) = match p.credential {
+			Credential::Jwt(jws) => (
+				jws::verify::<Claims>(jws, &self.config.issuers, |c| &c.issuer)
+					.map_err(|e| deny(e.into()))?
+					.claims,
+				"jwt",
+			),
+			Credential::Vc(raw) => {
+				let verified = vc::verify(raw, &self.config.issuers, now, skew).map_err(|e| {
+					deny(match e {
+						vc::VcError::UnknownKey => Denial::UnknownKey,
+						vc::VcError::BadSignature => Denial::BadSignature,
+						vc::VcError::UntrustedIssuer(i) => Denial::UntrustedIssuer(i),
+						vc::VcError::UnsupportedCryptosuite(c) => Denial::UnsupportedAlgorithm(c),
+						e => Denial::MalformedCredential(e.to_string()),
+					})
+				})?;
+				(
+					serde_json::from_value::<Claims>(verified.claims)
+						.map_err(|e| deny(Denial::MalformedCredential(e.to_string())))?,
+					"vc+json",
+				)
+			},
+		};
 
 		// RP-CORE-03. A lapsed approval is not an attack, so it is re-elicited, not denied.
 		if now > claims.exp.saturating_add(skew) {
@@ -726,6 +763,7 @@ impl Guard {
 			varied_within_envelope: varied.iter().map(ToString::to_string).collect(),
 			reservation_id: consume.reservation.map(|r| r.id),
 			identity,
+			format,
 		})
 	}
 
@@ -978,10 +1016,16 @@ enum Verdict {
 	Deny(Denial),
 }
 
+/// The two HAPS-CC formats (`haps-v0.4.0.md` §11).
+enum Credential<'a> {
+	Jwt(String),
+	Vc(&'a str),
+}
+
 struct Presented<'a> {
 	metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
 	tool: &'a str,
-	credential: &'a str,
+	credential: &'a Credential<'a>,
 	intent: &'a str,
 	view: Option<&'a str>,
 	arguments: &'a Canon,
@@ -1110,8 +1154,9 @@ struct CallParams<'a> {
 
 #[derive(Deserialize, Default)]
 struct HapsMeta<'a> {
-	#[serde(rename = "haps/credential", default)]
-	credential: Option<String>,
+	/// A compact JWS (`jwt`) as a string, or a Verifiable Credential (`vc+json`) as an object.
+	#[serde(borrow, rename = "haps/credential", default)]
+	credential: Option<&'a RawValue>,
 	#[serde(borrow, rename = "haps/actionIntent", default)]
 	action_intent: Option<&'a RawValue>,
 	#[serde(borrow, rename = "haps/signingView", default)]

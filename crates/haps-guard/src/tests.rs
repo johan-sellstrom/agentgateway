@@ -306,6 +306,7 @@ async fn a_credential_carrying_the_published_hashes_is_accepted() {
 			varied_within_envelope: vec![],
 			reservation_id: None,
 			identity: None,
+			format: "jwt",
 		}
 	);
 	// The upstream receives exactly the approved arguments, and never the credential.
@@ -1787,3 +1788,4 @@ async fn a_challenge_answered_under_spend_on_success_is_spent_only_on_success() 
 
 mod identity;
 mod redis_store;
+mod vc;

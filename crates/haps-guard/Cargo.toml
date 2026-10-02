@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# Data Integrity proof verification for vc+json credentials (Ed25519, P-256).
+aws-lc-rs.workspace = true
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -38,5 +40,4 @@ haps-canon = { git = "https://github.com/iProov/HAPS-reference", rev = "fb15eac5
 haps-hash = { git = "https://github.com/iProov/HAPS-reference", rev = "fb15eac5773ae113bd62fdf1ac798217415a3f8f" }
 
 [dev-dependencies]
-aws-lc-rs.workspace = true
 tempfile.workspace = true
