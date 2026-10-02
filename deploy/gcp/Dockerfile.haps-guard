@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.11
+# The HAPS guard (mcpGuardrails gRPC processor). Build from the repository root:
+#   docker build -f deploy/gcp/Dockerfile.haps-guard .
+FROM docker.io/library/rust:1.98.0-trixie AS builder
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY tools ./tools
+COPY catalog ./catalog
+# haps-guard declares its haps-mint example from here.
+COPY deploy/gcp/mint ./deploy/gcp/mint
+
+RUN --mount=type=cache,id=guard-cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=guard-cargo-git,target=/usr/local/cargo/git \
+    cargo fetch --locked
+RUN --mount=type=cache,id=guard-target,target=/app/target \
+    --mount=type=cache,id=guard-cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=guard-cargo-git,target=/usr/local/cargo/git \
+    cargo build --locked --release -p haps-guard --bin haps-guard && \
+    mkdir /out && cp target/release/haps-guard /out/haps-guard
+
+FROM cgr.dev/chainguard/glibc-dynamic AS runner
+COPY --from=builder /out/haps-guard /app/haps-guard
+LABEL org.opencontainers.image.description="HAPS guard: mcpGuardrails processor requiring a HAPS approval bound to the exact MCP tool call (experimental)"
+ENTRYPOINT ["/app/haps-guard"]

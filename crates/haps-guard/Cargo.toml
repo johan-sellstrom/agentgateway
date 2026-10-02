@@ -10,6 +10,12 @@ publish = { workspace = true }
 name = "haps-guard"
 path = "src/main.rs"
 
+# Test trust anchors and approvals for the lab deployment in deploy/gcp (see its README).
+# An example so it uses the guard's own canonicaliser, hash and Signing View derivation.
+[[example]]
+name = "haps-mint"
+path = "../../deploy/gcp/mint/haps_mint.rs"
+
 [dependencies]
 anyhow.workspace = true
 # Data Integrity proof verification for vc+json credentials (Ed25519, P-256).

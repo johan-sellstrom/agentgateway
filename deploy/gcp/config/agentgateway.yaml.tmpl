@@ -1,0 +1,40 @@
+# agentgateway config for the lab. deploy.sh fills in the placeholders and stores the result in Secret
+# Manager (haps-gateway-config), mounted at /etc/agentgateway/config.yaml.
+#
+# Cloud Run IAM authenticates callers before a request reaches this process (the service is
+# deployed with --no-allow-unauthenticated). Both hops out of the gateway carry a Google ID
+# token minted for the gateway's service account, and both targets are internal-ingress,
+# IAM-only Cloud Run services that grant run.invoker to that account alone.
+mcp:
+  port: 8080
+  # Cloud Run may run several instances; nothing here needs a sticky session.
+  statefulMode: stateless
+  targets:
+  - name: demo
+    mcp:
+      host: ${DEMO_HOST}
+      port: 443
+      path: /mcp
+    policies:
+      backendTLS: {}
+      backendAuth:
+        gcp:
+          type: idToken
+          audience: https://${DEMO_HOST}
+  policies:
+    mcpGuardrails:
+      processors:
+      - kind: remote
+        host: ${GUARD_HOST}:443
+        policies:
+          backendTLS: {}
+          backendAuth:
+            gcp:
+              type: idToken
+              audience: https://${GUARD_HOST}
+        failureMode: failClosed
+        methods:
+          # Request side to verify and spend; response side to settle spendOn: success.
+          tools/call: full
+        metadata:
+          hapsReservation: mcpGuardrails.haps.reservation

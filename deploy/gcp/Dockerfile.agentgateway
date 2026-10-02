@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.11
+# agentgateway without the admin UI, for the HAPS lab. Build from the repository root:
+#   docker build -f deploy/gcp/Dockerfile.agentgateway .
+# The top-level Dockerfile also builds the UI; at this fork's commit `pnpm build` fails type
+# checking, and the UI is only served on the container's localhost admin port anyway.
+FROM docker.io/library/rust:1.98.0-trixie AS builder
+ARG PROFILE=quick-release
+ARG VERSION=dev
+ARG GIT_REVISION=unknown
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
+COPY crates ./crates
+COPY tools ./tools
+COPY catalog ./catalog
+# haps-guard declares its haps-mint example from here.
+COPY deploy/gcp/mint ./deploy/gcp/mint
+
+RUN --mount=type=cache,id=gw-cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=gw-cargo-git,target=/usr/local/cargo/git \
+    cargo fetch --locked
+RUN --mount=type=cache,id=gw-target,target=/app/target \
+    --mount=type=cache,id=gw-cargo,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=gw-cargo-git,target=/usr/local/cargo/git \
+    VERSION="${VERSION}" GIT_REVISION="${GIT_REVISION}" \
+    cargo build --locked --profile "${PROFILE}" -p agentgateway-app --bin agentgateway && \
+    mkdir /out && cp "target/${PROFILE}/agentgateway" /out/agentgateway && \
+    /out/agentgateway --version
+
+FROM cgr.dev/chainguard/glibc-dynamic AS runner
+ENV AGENTGATEWAY_ENV=container
+COPY --from=builder /out/agentgateway /app/agentgateway
+ENTRYPOINT ["/app/agentgateway"]

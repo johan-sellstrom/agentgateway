@@ -1,0 +1,45 @@
+# Builds the three images in parallel. Submitted from the repository root by deploy.sh:
+#   gcloud builds submit --config deploy/gcp/cloudbuild.yaml --ignore-file deploy/gcp/gcloudignore \
+#     --substitutions _REPO=...,_TAG=... .
+substitutions:
+  _REPO: europe-west2-docker.pkg.dev/lab-mcp-johan/haps
+  _TAG: dev
+  # quick-release: optimised, no LTO, 16 codegen units. `release` (fat LTO, 1 CGU) produces a
+  # slightly faster binary but takes several times longer to build; fine for a lab.
+  _GATEWAY_PROFILE: quick-release
+options:
+  machineType: E2_HIGHCPU_32
+  env:
+  - DOCKER_BUILDKIT=1
+timeout: 5400s
+steps:
+- id: gateway
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['-']
+  args:
+  - build
+  - --build-arg=PROFILE=${_GATEWAY_PROFILE}
+  - --build-arg=VERSION=${_TAG}
+  - --build-arg=GIT_REVISION=${_TAG}
+  - -t=${_REPO}/agentgateway:${_TAG}
+  - -f=deploy/gcp/Dockerfile.agentgateway
+  - .
+- id: haps-guard
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['-']
+  args:
+  - build
+  - -t=${_REPO}/haps-guard:${_TAG}
+  - -f=deploy/gcp/Dockerfile.haps-guard
+  - .
+- id: demo-mcp
+  name: gcr.io/cloud-builders/docker
+  waitFor: ['-']
+  args:
+  - build
+  - -t=${_REPO}/demo-mcp:${_TAG}
+  - deploy/gcp/demo-mcp
+images:
+- ${_REPO}/agentgateway:${_TAG}
+- ${_REPO}/haps-guard:${_TAG}
+- ${_REPO}/demo-mcp:${_TAG}

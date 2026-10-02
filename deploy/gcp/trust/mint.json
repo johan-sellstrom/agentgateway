@@ -1,0 +1,14 @@
+{
+  "audience": {
+    "id": "did:web:haps-gateway-505641596927.europe-west2.run.app",
+    "name": "HAPS lab gateway"
+  },
+  "agent": {
+    "id": "did:web:agent.haps-lab.invalid",
+    "name": "HAPS lab agent"
+  },
+  "issuer": "did:web:test-pp.haps-lab.invalid",
+  "certifier": "did:web:test-certifier.haps-lab.invalid",
+  "providerId": "test-pp",
+  "pccRef": "https://test-certifier.haps-lab.invalid/pcc/test-pp"
+}
